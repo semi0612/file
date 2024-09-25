@@ -1,0 +1,131 @@
+!pip install datasets
+!pip install peft
+!pip install bitsandbytes
+
+!pip install accelerate
+!pip install trl
+!pip install transformers sentencepiece scipy
+
+!pip install wandb
+
+----------------------------------------------------
+from datasets import load_dataset
+
+dataset = load_dataset("text", data_files="/workspace/self-instruction_data_test.txt", split="train")
+print(dataset)
+print(dataset['text'])
+
+----------------------------------------------------
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+# model
+model_name='davidkim205/komt-mistral-7b-v1'
+model = AutoModelForCausalLM.from_pretrained(model_name, device_map="auto", trust_remote_code=True)
+model_org = model
+model.config.use_cache = False
+model.gradient_checkpointing_enable()
+
+# 토크나이저
+tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False, device_map="auto", trust_remote_code=True)
+tokenizer_org = tokenizer
+tokenizer.pad_token = tokenizer.eos_token 
+tokenizer.add_eos_token = True
+tokenizer.add_bos_token, tokenizer.add_eos_token
+
+----------------------------------------------------
+# fine tuning을 위해
+from peft import prepare_model_for_kbit_training, LoraConfig, get_peft_model
+
+model = prepare_model_for_kbit_training(model)
+
+# Lora fine tuning 설정
+peft_config = LoraConfig(
+    r=16,
+    lora_alpha=16,
+    lora_dropout=0.05,
+    bias="none",
+    task_type="CAUSAL_LM",
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj","gate_proj"]
+)
+model = get_peft_model(model, peft_config)
+
+----------------------------------------------------
+from transformers import TrainingArguments
+
+# training 설정
+training_arguments = TrainingArguments( 
+   output_dir= "./results" , 
+   num_train_epochs=100,
+   per_device_train_batch_size=32,
+   gradient_accumulation_steps=8,
+   optim = "paged_adamw_8bit",
+   save_steps=1000,
+   logging_steps= 30,
+   learning_rate=2e-4,#1e-6,
+   max_grad_norm= 0.3,
+   warmup_ratio= 0.3,
+   group_by_length= True,
+   lr_scheduler_type= "constant",
+   report_to="wandb"
+)
+
+----------------------------------------------------
+from trl import SFTTrainer
+
+trainer = SFTTrainer(
+    model=model,
+    train_dataset=dataset,
+    dataset_text_field="text",
+    peft_config=peft_config,
+    max_seq_length= None,
+    tokenizer=tokenizer,
+    args=training_arguments,
+    packing= False,
+)
+
+----------------------------------------------------
+%%time
+#
+trainer.train()
+print("done")
+
+----------------------------------------------------
+
+## Test
+
+# wandb.finish()
+model.config.use_cache = True
+model.eval()
+# 재학습시 학습 이어가기
+# model.config.use_cache = False
+# model.train()
+
+----------------------------------------------------
+from transformers import TextStreamer
+
+def stream(user_prompt, model):
+    runtimeFlag = "cuda:0"
+    system_prompt = 'The conversation between Human and AI assisatance about RPACA.'
+    B_INST, E_INST = "[INST]", "[/INST]"
+    prompt = f"{system_prompt}{B_INST}{user_prompt.strip()}{E_INST}\n"
+    inputs = tokenizer([prompt], return_tensors="pt").to(runtimeFlag)
+    streamer = TextStreamer(tokenizer, skip_prompt=False, skip_special_tokens=True)
+    _ = model.generate(**inputs, streamer=streamer, max_new_tokens=1024, use_cache=True)
+
+----------------------------------------------------
+## num_train_epochs=100, per_device_train_batch_size=32, gradient_accumulation_steps=8
+# 변수를 생성하려면 Activity의 옵션에서 값을 입력하는 부분에 ${}로 변수명을 감싸주면 됩니다.
+stream("RPACA에서 변수를 생성하려면 어떻게 하나요?", model)
+
+# 네, RPACA 스크립트에서 변수를 사용할 수 있습니다.
+stream("RPACA 스크립트를 사용하여 변수를 사용할 수 있나요?", model)
+
+#
+stream("RPACA 설치 가이드", model)
+
+----------------------------------------------------
+## 모델 저장 및 db 연결 해제
+trainer.model.save_pretrained("/workspace/new_model/")
+tokenizer.save_pretrained("/workspace/new_model/")
+# wandb.finish()
